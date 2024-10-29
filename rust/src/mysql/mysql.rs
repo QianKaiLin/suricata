@@ -361,9 +361,7 @@ impl MysqlState {
     ) -> Option<MysqlStateProgress> {
         match request {
             MysqlFEMessage::HandshakeResponse(resp) => {
-                if resp.client_flags & CLIENT_DEPRECATE_EOF != 0
-                    || resp.client_flags & CLIENT_OPTIONAL_RESULTSET_METADATA != 0
-                {
+                if resp.client_flags & CLIENT_OPTIONAL_RESULTSET_METADATA != 0 {
                     return Some(MysqlStateProgress::Finished);
                 }
                 self.client_flags = resp.client_flags;
@@ -855,8 +853,8 @@ impl MysqlState {
                 MysqlResponsePacket::ResultSet {
                     n_cols: _,
                     columns: _,
-                    eof,
                     rows,
+                    multi_statement,
                 } => {
                     let tx = if self.tx_id > 0 {
                         self.get_tx_mut(self.tx_id - 1)
@@ -866,7 +864,7 @@ impl MysqlState {
                     if !rows.is_empty() {
                         let mut rows = rows.into_iter().map(|row| row.texts.join(",")).collect();
                         if let Some(tx) = tx {
-                            if eof.status_flags != 0x0A {
+                            if !multi_statement {
                                 tx.rows = Some(rows);
                                 Some(MysqlStateProgress::CommandResponseReceived)
                             } else {
@@ -907,8 +905,8 @@ impl MysqlState {
                 }
                 MysqlResponsePacket::BinaryResultSet {
                     n_cols: _,
-                    eof,
                     rows,
+                    multi_resultset,
                 } => {
                     if self.state_progress == MysqlStateProgress::StmtFetchReceived
                         || self.state_progress == MysqlStateProgress::StmtFetchResponseContinue
@@ -917,7 +915,7 @@ impl MysqlState {
                     }
 
                     if !rows.is_empty() {
-                        if eof.status_flags != 0x0A {
+                        if !multi_resultset {
                             let tx = if self.tx_id > 0 {
                                 self.get_tx_mut(self.tx_id - 1)
                             } else {
@@ -973,13 +971,13 @@ impl MysqlState {
             }
 
             MysqlStateProgress::StmtExecReceived | MysqlStateProgress::StmtExecResponseContinue => {
-                let (i, resp) = parse_stmt_execute_response(i)?;
+                let (i, resp) = parse_stmt_execute_response(i, client_flags)?;
                 Ok((i, MysqlBEMessage::Response(resp)))
             }
 
             MysqlStateProgress::StmtFetchReceived
             | MysqlStateProgress::StmtFetchResponseContinue => {
-                let (i, resp) = parse_stmt_fetch_response(i)?;
+                let (i, resp) = parse_stmt_fetch_response(i, client_flags)?;
                 Ok((i, MysqlBEMessage::Response(resp)))
             }
 
@@ -997,7 +995,7 @@ impl MysqlState {
             }
 
             _ => {
-                let (i, resp) = parse_response(i)?;
+                let (i, resp) = parse_response(i, client_flags)?;
                 Ok((i, MysqlBEMessage::Response(resp)))
             }
         }
