@@ -18,7 +18,9 @@
 // Author: QianKaiLin <linqiankai666@outlook.com>
 
 //! MySQL nom parsers
+use std::io::Read;
 
+use flate2::bufread::ZlibDecoder;
 use nom7::{
     bytes::streaming::{take, take_till},
     combinator::{cond, map, verify},
@@ -31,6 +33,7 @@ use nom7::{
 };
 use num::{FromPrimitive, ToPrimitive};
 use suricata_derive::EnumStringU8;
+use zstd::Decoder as ZstdDecoder;
 
 #[allow(dead_code)]
 pub const CLIENT_LONG_PASSWORD: u32 = BIT_U32!(0);
@@ -41,8 +44,7 @@ pub const CLIENT_LONG_FLAG: u32 = BIT_U32!(2);
 const CLIENT_CONNECT_WITH_DB: u32 = BIT_U32!(3);
 #[allow(dead_code)]
 const CLIENT_NO_SCHEMA: u32 = BIT_U32!(4);
-#[allow(dead_code)]
-const CLIENT_COMPRESS: u32 = BIT_U32!(5);
+pub const CLIENT_COMPRESS: u32 = BIT_U32!(5);
 #[allow(dead_code)]
 const CLIENT_ODBC: u32 = BIT_U32!(6);
 #[allow(dead_code)]
@@ -80,7 +82,6 @@ pub const CLIENT_SESSION_TRACK: u32 = BIT_U32!(23);
 pub const CLIENT_DEPRECATE_EOF: u32 = BIT_U32!(24);
 #[allow(dead_code)]
 pub const CLIENT_OPTIONAL_RESULTSET_METADATA: u32 = BIT_U32!(25);
-#[allow(dead_code)]
 pub const CLIENT_ZSTD_COMPRESSION_ALGORITHM: u32 = BIT_U32!(26);
 #[allow(dead_code)]
 pub const CLIENT_QUERY_ATTRIBUTES: u32 = BIT_U32!(27);
@@ -146,6 +147,14 @@ fn parse_field_type(field_type: u8) -> FieldType {
     } else {
         FieldType::Invalid
     }
+}
+
+#[derive(Debug)]
+pub struct MysqlCompressedPacket {
+    pub comp_pkt_len: usize,
+    pub comp_pkt_num: u8,
+    pub uncomp_pkt_len: usize,
+    pub payload: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -412,6 +421,82 @@ fn parse_varint(i: &[u8]) -> IResult<&[u8], u64> {
             Ok((i, v0 | v1 | v2 | v3 | v4 | v5 | v6 | v7))
         }
         _ => Ok((i, length as u64)),
+    }
+}
+
+pub fn parse_compressed_packet(i: &[u8], zstd: bool) -> IResult<&[u8], MysqlCompressedPacket> {
+    let (i, comp_pkt_len) = verify(le_u24, |&pkt_len| -> bool { pkt_len <= PAYLOAD_MAX_LEN })(i)?;
+    let (i, comp_pkt_num) = be_u8(i)?;
+    let (i, uncomp_pkt_len) = verify(le_u24, |&pkt_len| -> bool { pkt_len <= PAYLOAD_MAX_LEN })(i)?;
+    let (i, payload) = take(comp_pkt_len)(i)?;
+    let mut comp_pkt_len = comp_pkt_len as usize;
+    let mut uncomp_pkt_len = uncomp_pkt_len as usize;
+    if uncomp_pkt_len == 0 {
+        Ok((
+            i,
+            MysqlCompressedPacket {
+                comp_pkt_len,
+                comp_pkt_num,
+                uncomp_pkt_len,
+                payload: payload.to_vec(),
+            },
+        ))
+    } else if comp_pkt_len < PAYLOAD_MAX_LEN as usize {
+        let payload = decompress_payload(payload, zstd);
+        Ok((
+            i,
+            MysqlCompressedPacket {
+                comp_pkt_len,
+                comp_pkt_num,
+                uncomp_pkt_len,
+                payload,
+            },
+        ))
+    } else {
+        let mut rem = i;
+        let mut payload = payload.to_vec();
+        loop {
+            let (i, next_comp_pkt_len) =
+                verify(le_u24, |&pkt_len| -> bool { pkt_len <= PAYLOAD_MAX_LEN })(rem)?;
+            comp_pkt_len += next_comp_pkt_len as usize;
+
+            let (i, _) = verify(be_u8, |&pkt_num| pkt_num == comp_pkt_num)(i)?;
+
+            let (i, next_uncomp_pkt_len) =
+                verify(le_u24, |&pkt_len| -> bool { pkt_len <= PAYLOAD_MAX_LEN })(i)?;
+            uncomp_pkt_len += next_uncomp_pkt_len as usize;
+
+            let (i, next_payload) = take(next_comp_pkt_len)(i)?;
+            payload.extend(decompress_payload(next_payload, zstd));
+
+            rem = i;
+            if next_comp_pkt_len < PAYLOAD_MAX_LEN {
+                break;
+            }
+        }
+        Ok((
+            rem,
+            MysqlCompressedPacket {
+                comp_pkt_len,
+                comp_pkt_num,
+                uncomp_pkt_len,
+                payload,
+            },
+        ))
+    }
+}
+
+fn decompress_payload(i: &[u8], zstd: bool) -> Vec<u8> {
+    if zstd {
+        let mut decoder = ZstdDecoder::new(i).unwrap();
+        let mut payload: Vec<u8> = vec![];
+        decoder.read_to_end(&mut payload).unwrap_or_default();
+        payload
+    } else {
+        let mut decoder = ZlibDecoder::new(i);
+        let mut payload: Vec<u8> = vec![];
+        decoder.read_to_end(&mut payload).unwrap_or_default();
+        payload
     }
 }
 
@@ -1986,44 +2071,57 @@ pub fn parse_field_list_response(i: &[u8]) -> IResult<&[u8], MysqlResponse> {
     }
 }
 
-pub fn parse_stmt_prepare_response(i: &[u8], _client_flags: u32) -> IResult<&[u8], MysqlResponse> {
-    let (rem, header) = parse_packet_header(i)?;
+pub fn parse_stmt_prepare_response(i: &[u8], client_flags: u32) -> IResult<&[u8], MysqlResponse> {
+    let (rem, packet) = parse_packet_header(i)?;
     let payload =
-        unsafe { std::slice::from_raw_parts(header.payload.as_ptr(), header.payload.len()) };
+        unsafe { std::slice::from_raw_parts(packet.payload.as_ptr(), packet.payload.len()) };
     let (i, response_code) = be_u8(payload)?;
     match response_code {
         0x00 => {
             let (i, statement_id) = le_u32(i)?;
             let (i, num_columns) = le_u16(i)?;
-            let (i, num_params) = le_u16(i)?;
-            let (i, _filter) = be_u8(i)?;
-            //TODO: why?
-            // let (i, _warning_cnt) = cond(header.pkt_len > 12, take(2_u32))(i)?;
-            let (_, _warning_cnt) = take(2_u32)(i)?;
+            let (_, num_params) = le_u16(i)?;
             // should use remain
             let (i, params) = cond(
                 num_params > 0,
-                many_till(parse_column_definition, parse_eof_packet),
+                many_m_n(
+                    num_params as usize,
+                    num_params as usize,
+                    parse_column_definition,
+                ),
             )(rem)
             .map(|(i, params)| {
                 if let Some(params) = params {
-                    (i, Some(params.0))
+                    (i, Some(params))
                 } else {
                     (i, None)
                 }
             })?;
+            let (i, _) = cond(
+                num_params > 0 && client_flags & CLIENT_DEPRECATE_EOF == 0,
+                parse_eof_packet,
+            )(i)?;
+
             // should use remain
-            let (_, fields) = cond(
+            let (i, fields) = cond(
                 num_columns > 0,
-                many_till(parse_column_definition, parse_eof_packet),
+                many_m_n(
+                    num_columns as usize,
+                    num_columns as usize,
+                    parse_column_definition,
+                ),
             )(i)
             .map(|(i, fields)| {
                 if let Some(fields) = fields {
-                    (i, Some(fields.0))
+                    (i, Some(fields))
                 } else {
                     (i, None)
                 }
             })?;
+            let (i, _) = cond(
+                num_columns > 0 && client_flags & CLIENT_DEPRECATE_EOF == 0,
+                parse_eof_packet,
+            )(i)?;
 
             Ok((
                 i,
@@ -2121,6 +2219,20 @@ pub fn parse_auth_responsev2(i: &[u8]) -> IResult<&[u8], MysqlResponse> {
 mod test {
 
     use super::*;
+
+    #[test]
+    fn test_parse_compressed_packet() {
+        let pkt: &[u8] = &[
+            0x3f, 0x00, 0x00, 0x01, 0x6a, 0x00, 0x00, 0x78, 0x9c, 0xe3, 0x61, 0x60, 0x60, 0x04,
+            0x42, 0x10, 0x60, 0x06, 0x11, 0xe2, 0x0c, 0x0c, 0x4c, 0xcc, 0x29, 0xa9, 0x69, 0x40,
+            0x26, 0xa3, 0x3d, 0x03, 0x8f, 0x3d, 0x83, 0x28, 0x90, 0xc5, 0xd1, 0x00, 0x95, 0x62,
+            0xc6, 0x2d, 0xc5, 0x82, 0x24, 0xa5, 0xcb, 0xf0, 0x1f, 0x08, 0x7e, 0x33, 0x30, 0xc8,
+            0x33, 0x30, 0xb0, 0x02, 0xd1, 0x3f, 0xa0, 0xa1, 0x0c, 0x00, 0xd4, 0xad, 0x0c, 0xdf,
+        ];
+        let (rem, packet) = parse_compressed_packet(pkt, false).unwrap();
+        assert!(rem.is_empty());
+        assert!(packet.comp_pkt_len != 0);
+    }
 
     #[test]
     fn test_parse_handshake_request() {

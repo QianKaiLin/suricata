@@ -234,10 +234,15 @@ pub struct MysqlState {
     tx_index_completed: usize,
 
     client_flags: u32,
+    server_flags: u32,
     version: Option<String>,
     tls: bool,
     /// stmt prepare
     prepare_stmt: Option<MysqlStatement>,
+    /// If None: not compressed, else if Some(true): zstd, else: zlib
+    zstd: Option<bool>,
+    /// AuthFinished state
+    handshake_done: bool,
 }
 
 impl State<MysqlTransaction> for MysqlState {
@@ -268,9 +273,12 @@ impl MysqlState {
             tx_index_completed: 0,
 
             client_flags: 0,
+            server_flags: 0,
             version: None,
             tls: false,
             prepare_stmt: None,
+            zstd: None,
+            handshake_done: false,
         };
         state
     }
@@ -305,6 +313,10 @@ impl MysqlState {
 
     fn set_event(tx: &mut MysqlTransaction, event: MysqlEvent) {
         tx.tx_data.set_event(event as u8);
+    }
+
+    fn is_compressed(&self) -> bool {
+        self.zstd.is_some() && self.handshake_done
     }
 
     fn new_tx(&mut self, command: String) -> MysqlTransaction {
@@ -349,16 +361,20 @@ impl MysqlState {
     ) -> Option<MysqlStateProgress> {
         match request {
             MysqlFEMessage::HandshakeResponse(resp) => {
-                // for now, don't support compress
-                if resp.zstd_compression_level.is_some() {
-                    return Some(MysqlStateProgress::Finished);
-                }
                 if resp.client_flags & CLIENT_DEPRECATE_EOF != 0
                     || resp.client_flags & CLIENT_OPTIONAL_RESULTSET_METADATA != 0
                 {
                     return Some(MysqlStateProgress::Finished);
                 }
                 self.client_flags = resp.client_flags;
+                if resp.zstd_compression_level.is_some() {
+                    self.zstd = Some(true);
+                } else if self.server_flags & CLIENT_COMPRESS != 0
+                    && self.client_flags & CLIENT_COMPRESS != 0
+                {
+                    self.zstd = Some(false);
+                }
+
                 Some(MysqlStateProgress::Auth)
             }
             MysqlFEMessage::SSLRequest(_) => {
@@ -556,38 +572,95 @@ impl MysqlState {
                 param_types = prepare_stmt.param_types.clone();
             }
 
-            match MysqlState::state_based_req_parsing(
-                self.state_progress,
-                start,
-                param_cnt,
-                param_types.clone(),
-                stmt_long_datas,
-                self.client_flags,
-            ) {
-                Ok((rem, request)) => {
-                    SCLogDebug!("Request is {:?}", &request);
-                    start = rem;
-                    if let Some(state) = self.request_next_state(request, flow) {
-                        self.state_progress = state;
+            if self.is_compressed() {
+                let zstd = self.zstd.unwrap_or_default();
+                let (rem, i) = match parse_compressed_packet(start, zstd) {
+                    Ok((rem, decompressed_packet)) => (rem, decompressed_packet.payload),
+                    Err(nom7::Err::Incomplete(_needed)) => {
+                        let consumed = i.len() - start.len();
+                        let needed_estimation = start.len() + 1;
+                        SCLogDebug!(
+                            "Needed: {:?}, estimated needed: {:?}",
+                            _needed,
+                            needed_estimation
+                        );
+                        return AppLayerResult::incomplete(
+                            consumed as u32,
+                            needed_estimation as u32,
+                        );
+                    }
+                    Err(err) => {
+                        SCLogError!(
+                            "Error while parsing MySQL compressed packet, state: {:?} err: {:?}",
+                            self.state_progress,
+                            err
+                        );
+                        return AppLayerResult::err();
+                    }
+                };
+                start = rem;
+
+                match MysqlState::state_based_req_parsing(
+                    self.state_progress,
+                    i.as_slice(),
+                    param_cnt,
+                    param_types,
+                    stmt_long_datas,
+                    self.client_flags,
+                ) {
+                    Ok((_, request)) => {
+                        SCLogDebug!("Request is {:?}", &request);
+                        if let Some(state) = self.request_next_state(request, flow) {
+                            self.state_progress = state;
+                        }
+                    }
+
+                    Err(err) => {
+                        SCLogError!(
+                            "Error while parsing MySQL compressed packet, state: {:?} err: {:?}",
+                            self.state_progress,
+                            err
+                        );
+                        return AppLayerResult::err();
                     }
                 }
-                Err(nom7::Err::Incomplete(_needed)) => {
-                    let consumed = i.len() - start.len();
-                    let needed_estimation = start.len() + 1;
-                    SCLogDebug!(
-                        "Needed: {:?}, estimated needed: {:?}",
-                        _needed,
-                        needed_estimation
-                    );
-                    return AppLayerResult::incomplete(consumed as u32, needed_estimation as u32);
-                }
-                Err(err) => {
-                    SCLogError!(
-                        "Error while parsing MySQL request, state: {:?} err: {:?}",
-                        self.state_progress,
-                        err
-                    );
-                    return AppLayerResult::err();
+            } else {
+                match MysqlState::state_based_req_parsing(
+                    self.state_progress,
+                    start,
+                    param_cnt,
+                    param_types.clone(),
+                    stmt_long_datas,
+                    self.client_flags,
+                ) {
+                    Ok((rem, request)) => {
+                        SCLogDebug!("Request is {:?}", &request);
+                        start = rem;
+                        if let Some(state) = self.request_next_state(request, flow) {
+                            self.state_progress = state;
+                        }
+                    }
+                    Err(nom7::Err::Incomplete(_needed)) => {
+                        let consumed = i.len() - start.len();
+                        let needed_estimation = start.len() + 1;
+                        SCLogDebug!(
+                            "Needed: {:?}, estimated needed: {:?}",
+                            _needed,
+                            needed_estimation
+                        );
+                        return AppLayerResult::incomplete(
+                            consumed as u32,
+                            needed_estimation as u32,
+                        );
+                    }
+                    Err(err) => {
+                        SCLogError!(
+                            "Error while parsing MySQL request, state: {:?} err: {:?}",
+                            self.state_progress,
+                            err
+                        );
+                        return AppLayerResult::err();
+                    }
                 }
             }
         }
@@ -604,6 +677,7 @@ impl MysqlState {
         match response {
             MysqlBEMessage::HandshakeRequest(req) => {
                 self.version = Some(req.version.clone());
+                self.server_flags = req.capability_flags1 as u32;
                 Some(MysqlStateProgress::Handshake)
             }
 
@@ -704,7 +778,10 @@ impl MysqlState {
                     flags: _,
                     warnings: _,
                 } => match self.state_progress {
-                    MysqlStateProgress::Auth => Some(MysqlStateProgress::AuthFinished),
+                    MysqlStateProgress::Auth => {
+                        self.handshake_done = true;
+                        Some(MysqlStateProgress::AuthFinished)
+                    }
                     MysqlStateProgress::CommandReceived => {
                         let tx = if self.tx_id > 0 {
                             self.get_tx_mut(self.tx_id - 1)
@@ -956,37 +1033,90 @@ impl MysqlState {
             if self.state_progress == MysqlStateProgress::Finished || self.invalid_state_resp() {
                 return AppLayerResult::ok();
             }
-            match MysqlState::state_based_resp_parsing(
-                self.state_progress,
-                start,
-                self.client_flags,
-            ) {
-                Ok((rem, response)) => {
-                    start = rem;
+            if self.is_compressed() {
+                let zstd = self.zstd.unwrap_or_default();
+                let (rem, i) = match parse_compressed_packet(start, zstd) {
+                    Ok((rem, decompressed_packet)) => (rem, decompressed_packet.payload),
+                    Err(nom7::Err::Incomplete(_needed)) => {
+                        let consumed = i.len() - start.len();
+                        let needed_estimation = start.len() + 1;
+                        SCLogDebug!(
+                            "Needed: {:?}, estimated needed: {:?}",
+                            _needed,
+                            needed_estimation
+                        );
+                        return AppLayerResult::incomplete(
+                            consumed as u32,
+                            needed_estimation as u32,
+                        );
+                    }
+                    Err(err) => {
+                        SCLogError!(
+                            "Error while parsing MySQL compressed packet, state: {:?} err: {:?}",
+                            self.state_progress,
+                            err
+                        );
+                        return AppLayerResult::err();
+                    }
+                };
+                start = rem;
 
-                    SCLogDebug!("Response is {:?}", &response);
-                    if let Some(state) = self.response_next_state(response) {
-                        self.state_progress = state;
+                match MysqlState::state_based_resp_parsing(
+                    self.state_progress,
+                    i.as_slice(),
+                    self.client_flags,
+                ) {
+                    Ok((_, response)) => {
+                        SCLogDebug!("Response is {:?}", &response);
+                        if let Some(state) = self.response_next_state(response) {
+                            self.state_progress = state;
+                        }
+                    }
+                    Err(err) => {
+                        SCLogError!(
+                            "Error while parsing MySQL response, state: {:?} err: {:?}",
+                            self.state_progress,
+                            err,
+                        );
+                        return AppLayerResult::err();
                     }
                 }
-                Err(nom7::Err::Incomplete(_needed)) => {
-                    let consumed = i.len() - start.len();
-                    let needed_estimation = start.len() + 1;
-                    SCLogDebug!(
-                        "Needed: {:?}, estimated needed: {:?}, start is {:?}",
-                        _needed,
-                        needed_estimation,
-                        &start
-                    );
-                    return AppLayerResult::incomplete(consumed as u32, needed_estimation as u32);
-                }
-                Err(_err) => {
-                    SCLogDebug!(
-                        "Error while parsing MySQL response, state: {:?} err: {:?}",
-                        self.state_progress,
-                        _err,
-                    );
-                    return AppLayerResult::err();
+            } else {
+                match MysqlState::state_based_resp_parsing(
+                    self.state_progress,
+                    start,
+                    self.client_flags,
+                ) {
+                    Ok((rem, response)) => {
+                        start = rem;
+
+                        SCLogDebug!("Response is {:?}", &response);
+                        if let Some(state) = self.response_next_state(response) {
+                            self.state_progress = state;
+                        }
+                    }
+                    Err(nom7::Err::Incomplete(_needed)) => {
+                        let consumed = i.len() - start.len();
+                        let needed_estimation = start.len() + 1;
+                        SCLogDebug!(
+                            "Needed: {:?}, estimated needed: {:?}, start is {:?}",
+                            _needed,
+                            needed_estimation,
+                            &start
+                        );
+                        return AppLayerResult::incomplete(
+                            consumed as u32,
+                            needed_estimation as u32,
+                        );
+                    }
+                    Err(err) => {
+                        SCLogError!(
+                            "Error while parsing MySQL response, state: {:?} err: {:?}",
+                            self.state_progress,
+                            err,
+                        );
+                        return AppLayerResult::err();
+                    }
                 }
             }
         }
