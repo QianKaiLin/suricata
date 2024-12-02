@@ -2008,26 +2008,25 @@ pub fn parse_request(
         }
 
         0x19 => {
-            //
-            if packet.pkt_len - 1 == 8 {
-                let (_, command) = parse_stmt_fetch_cmd(i)?;
-                Ok((
-                    rem,
-                    MysqlRequest {
-                        command_code,
-                        command,
-                    },
-                ))
-            } else {
-                let (_, command) = parse_stmt_close_cmd(i)?;
-                Ok((
-                    rem,
-                    MysqlRequest {
-                        command_code,
-                        command,
-                    },
-                ))
-            }
+            let (_, command) = parse_stmt_close_cmd(i)?;
+            Ok((
+                rem,
+                MysqlRequest {
+                    command_code,
+                    command,
+                },
+            ))
+        }
+
+        0x1C => {
+            let (_, command) = parse_stmt_fetch_cmd(i)?;
+            Ok((
+                rem,
+                MysqlRequest {
+                    command_code,
+                    command,
+                },
+            ))
         }
 
         _ => {
